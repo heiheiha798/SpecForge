@@ -259,6 +259,25 @@ class SharedDirFeatureStore(FeatureStore):
             self._generation.pop(sample_id, None)
             self._put_time.pop(sample_id, None)
 
+    def reclaim(self, sample_ref: SampleRef, *, reason: str = "consumed") -> None:
+        """Free only the generation named by a globally consumed fan-out ref."""
+        gen = sample_ref.metadata.get("generation")
+        if gen is None:
+            raise ValueError(
+                f"cannot reclaim {sample_ref.sample_id}: ref carries no generation"
+            )
+        gen = int(gen)
+        with self._lock:
+            if any(
+                handle.sample_id == sample_ref.sample_id and handle.generation == gen
+                for handle in self._active_leases.values()
+            ):
+                raise RuntimeError(
+                    f"cannot reclaim leased sample {sample_ref.sample_id} "
+                    f"generation {gen}"
+                )
+            self._free_gen_locked(sample_ref.sample_id, gen)
+
     def gc(self, *, now: Optional[float] = None) -> Dict[str, int]:
         # Max-hold force-free uses this instance's _put_time (single-host). A
         # true cross-node sweeper reads the durable index / file mtime; that is

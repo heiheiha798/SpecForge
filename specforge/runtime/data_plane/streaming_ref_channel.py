@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from typing import Iterator, List, Optional, Set
 
@@ -64,6 +65,7 @@ class StreamingRefChannel:
         self._read_offset = 0
         self._buf = ""
         self._consumed = 0
+        self._consumed_lock = threading.Lock()
 
     # -- producer ----------------------------------------------------------
     def publish(self, ref: SampleRef) -> None:
@@ -87,6 +89,23 @@ class StreamingRefChannel:
     @property
     def published(self) -> int:
         return self._published
+
+    def seed_published(self) -> int:
+        """Adopt the complete append-only history as producer progress.
+
+        A producer process that resumes an existing channel must call this before
+        applying ``in_flight_remote`` backpressure; otherwise its fresh in-memory
+        publication counter would ignore refs written by the prior process.
+        """
+        try:
+            with open(self.path, "rb") as f:
+                count = sum(
+                    chunk.count(b"\n") for chunk in iter(lambda: f.read(1 << 20), b"")
+                )
+        except FileNotFoundError:
+            count = 0
+        self._published = count
+        return count
 
     def consumed_remote(self) -> int:
         """How many refs the consumer reports having consumed (cross-process)."""
@@ -137,10 +156,38 @@ class StreamingRefChannel:
 
     def mark_consumed(self, n: int) -> None:
         """Record n more consumed refs in the sidecar the producer reads back."""
-        self._consumed += n
+        if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+            raise ValueError(
+                f"consumed increment must be a non-negative int, got {n!r}"
+            )
+        if n == 0:
+            return
+        with self._consumed_lock:
+            self._consumed += n
+            self._write_consumed_locked(durable=False)
+
+    def set_consumed(self, count: int) -> None:
+        """Publish an authoritative absolute consumed count.
+
+        Normal consumers should use :meth:`mark_consumed`. Recovery coordinators
+        use this method to rewind materialization progress to an optimizer-durable
+        cursor before replaying an append-only stream.
+        """
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError(
+                f"consumed count must be a non-negative int, got {count!r}"
+            )
+        with self._consumed_lock:
+            self._consumed = count
+            self._write_consumed_locked(durable=True)
+
+    def _write_consumed_locked(self, *, durable: bool) -> None:
         tmp = self.path + _CONSUMED_SUFFIX + ".tmp"
         with open(tmp, "w") as f:
             f.write(str(self._consumed))
+            if durable:
+                f.flush()
+                os.fsync(f.fileno())
         os.replace(tmp, self.path + _CONSUMED_SUFFIX)  # atomic counter publish
 
     def seed_consumed(self) -> int:
@@ -230,6 +277,11 @@ class StreamingRefQueue:
         self._clock = clock
         self._sleep = sleep
         self._buf: List[SampleRef] = []
+        # A channel is append-only and may replay a publication after a producer
+        # retry. Keep delivery and terminal effects idempotent by stable sample ID.
+        self._terminal_ids = set(skip_ids or ())
+        self._active_ids: Set[str] = set()
+        self._terminal_lock = threading.Lock()
         self._wait_log_interval_s = float(
             os.environ.get("SPECFORGE_STREAM_WAIT_LOG_INTERVAL", 30.0)
         )
@@ -243,15 +295,19 @@ class StreamingRefQueue:
         "made progress" from "nothing new" even when every polled ref was skipped.
         """
         raw = self.channel.poll()
-        if not self._skip_ids or not raw:
-            return raw, len(raw)
+        if not raw:
+            return raw, 0
         fresh: List[SampleRef] = []
         skipped = 0
-        for ref in raw:
-            if ref.sample_id in self._skip_ids:
-                self._skip_ids.discard(ref.sample_id)
-                skipped += 1
-            else:
+        with self._terminal_lock:
+            for ref in raw:
+                sid = ref.sample_id
+                if sid in self._terminal_ids or sid in self._active_ids:
+                    if self._skip_ids is not None:
+                        self._skip_ids.discard(sid)
+                    skipped += 1
+                    continue
+                self._active_ids.add(sid)
                 fresh.append(ref)
         if skipped:
             # already durably trained on a prior run: count them consumed so the
@@ -307,13 +363,40 @@ class StreamingRefQueue:
         return out
 
     def ack(self, refs: List[SampleRef]) -> None:
-        self.channel.mark_consumed(len(refs))  # backpressure: producer reads this
+        terminal = 0
+        with self._terminal_lock:
+            for ref in refs:
+                sid = ref.sample_id
+                if sid in self._terminal_ids or sid not in self._active_ids:
+                    continue
+                self._active_ids.discard(sid)
+                self._terminal_ids.add(sid)
+                terminal += 1
+        # Backpressure advances exactly once per stable sample ID.
+        self.channel.mark_consumed(terminal)
 
     def fail(self, refs: List[SampleRef], reason: str, retryable: bool) -> None:
         if retryable:
-            self._buf[:0] = refs  # re-buffer at the front for the next get()
+            with self._terminal_lock:
+                buffered = {ref.sample_id for ref in self._buf}
+                retry = [
+                    ref
+                    for ref in refs
+                    if ref.sample_id not in self._terminal_ids
+                    and ref.sample_id not in buffered
+                ]
+            self._buf[:0] = retry  # re-buffer at the front for the next get()
         else:
-            self.channel.mark_consumed(len(refs))
+            terminal = 0
+            with self._terminal_lock:
+                for ref in refs:
+                    sid = ref.sample_id
+                    if sid in self._terminal_ids or sid not in self._active_ids:
+                        continue
+                    self._active_ids.discard(sid)
+                    self._terminal_ids.add(sid)
+                    terminal += 1
+            self.channel.mark_consumed(terminal)
 
     def depth(self) -> int:
         return len(self._buf)

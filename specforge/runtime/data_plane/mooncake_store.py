@@ -17,12 +17,11 @@ the Mooncake store on one node; the consumer (trainer) ``get()``s them on
 another, peer-to-peer, with no shared filesystem. That is what makes this a
 genuine network object store rather than a shared mount.
 
-Scope (PR-A, the offline path M6 ships): this backend is correct for a single
-consumer process with ``retain_on_release`` for re-iterable epochs and
-whole-store cleanup at run end. The per-sample generation/lease *index* is
-in-process, mirroring ``SharedDirFeatureStore``'s documented single-host
-limitation. A true online multi-node deployment lifts that index into a shared
-metadata service — a separate follow-up, not this PR.
+Lifetime roles are explicit. The producer-side owner keeps the generation index
+and calls ``reclaim(ref)`` after the fan-out controller advances its global ACK
+prefix. Independent readers use ``lifetime_owner=False``: their releases drop
+only local lease bookkeeping and never remove the shared object. Offline
+re-iterable owners continue to use ``retain_on_release``.
 
 Contract carried from the reference backend:
 
@@ -45,9 +44,8 @@ Concurrency: ``release``/``abort``/``gc`` hold ``self._lock`` across the
 ``remove()`` RPC. The lock is what makes consume-once free race-free against a
 concurrent ``get()`` (it prevents a re-lease between "decide to free" and the
 remote delete), exactly as ``SharedDirFeatureStore`` holds its lock across
-``os.remove``. For the offline single-consumer path this is fine; a high-fanout
-online deployment that wants the ``remove()`` RPC off the critical section needs
-a tombstone-then-free protocol — a follow-up tied to the shared metadata index.
+``os.remove``. Fan-out performs this RPC only once on the owner, after all readers
+have released and acknowledged the ordered prefix.
 """
 
 from __future__ import annotations
@@ -186,6 +184,7 @@ class MooncakeFeatureStore(FeatureStore):
         max_resident_bytes: Optional[int] = None,
         max_hold_age_s: Optional[float] = None,
         retain_on_release: bool = False,
+        lifetime_owner: bool = True,
         max_release_attempts: int = 3,
         replica_num: int = 1,
         hard_pin: bool = True,
@@ -214,6 +213,10 @@ class MooncakeFeatureStore(FeatureStore):
         )
         self.max_resident_bytes = max_resident_bytes
         self.max_hold_age_s = max_hold_age_s
+        # Independent fan-out readers hold leases but never delete shared data.
+        # They drop local bookkeeping after their last lease; the owner reclaims
+        # the exact generation once the global consumer cursor advances.
+        self.lifetime_owner = lifetime_owner
         # Offline re-iterable mode: release() must NOT free (multi-epoch); mirrors
         # SharedDirFeatureStore / LocalFeatureStore file:// no-op release.
         self.retain_on_release = retain_on_release
@@ -406,6 +409,8 @@ class MooncakeFeatureStore(FeatureStore):
         sample_id: str,
         metadata: Dict[str, Any],
     ) -> SampleRef:
+        if not self.lifetime_owner:
+            raise RuntimeError("a non-owner MooncakeFeatureStore cannot publish")
         self.auth.check(self._credential)
         if not tensors:
             raise ValueError("put requires at least one tensor")
@@ -675,10 +680,14 @@ class MooncakeFeatureStore(FeatureStore):
     def release(self, handle: FeatureHandle, *, reason: str = "consumed") -> None:
         with self._lock:
             self._active_leases.pop(handle.lease_token, None)
-            if self.retain_on_release:
-                return  # offline re-iterable set: keep for the next epoch
             sid = handle.sample_id
             cur = self._generation.get(sid)
+            if not self.lifetime_owner:
+                if not self._still_leased_locked(sid, cur):
+                    self._free_bookkeeping_locked(sid)
+                return
+            if self.retain_on_release:
+                return  # offline re-iterable set: keep for the next epoch
             if cur is not None and handle.generation != cur:
                 return  # stale lease -> no-op
             if self._still_leased_locked(sid, cur):
@@ -692,6 +701,9 @@ class MooncakeFeatureStore(FeatureStore):
 
     def abort(self, sample_id: str, *, reason: str = "aborted") -> None:
         with self._lock:
+            if not self.lifetime_owner:
+                self._free_bookkeeping_locked(sample_id)
+                return
             gen = self._generation.get(sample_id)
             if gen is not None:
                 self._freed.add((sample_id, gen))  # immediate logical free
@@ -700,11 +712,51 @@ class MooncakeFeatureStore(FeatureStore):
             else:
                 self._release_pending.setdefault(sample_id, 0)
 
+    def reclaim(self, sample_ref: SampleRef, *, reason: str = "consumed") -> None:
+        """Reclaim one exact generation after every fan-out consumer ACKs.
+
+        Consumer instances use ``lifetime_owner=False`` and therefore only drop
+        their read leases and local bookkeeping. The owner instance keeps the
+        put/adopt inventory and calls this method from the distributor's
+        global-prefix callback. A stale callback is a no-op, so it cannot delete a
+        newer re-publication.
+        """
+        ref_gen = sample_ref.metadata.get("generation")
+        if ref_gen is None:
+            raise ValueError(
+                f"cannot reclaim {sample_ref.sample_id}: ref carries no generation"
+            )
+        sid, ref_gen = sample_ref.sample_id, int(ref_gen)
+        with self._lock:
+            if not self.lifetime_owner:
+                raise RuntimeError("only the Mooncake lifetime owner may reclaim")
+            current = self._generation.get(sid)
+            if current is None or current != ref_gen:
+                return
+            if self._still_leased_locked(sid, current):
+                raise RuntimeError(
+                    f"cannot reclaim leased sample {sid} generation {current}"
+                )
+            self._freed.add((sid, current))
+            if self._try_physical_free(sid):
+                self._free_bookkeeping_locked(sid)
+            else:
+                self._release_pending.setdefault(sid, 0)
+
     def gc(self, *, now: Optional[float] = None) -> Dict[str, int]:
         _t0 = time.monotonic() if self._prof_store else 0.0
         now = self._clock() if now is None else now
         freed = freed_bytes = 0
         with self._lock:
+            if not self.lifetime_owner:
+                for sid in list(self._generation):
+                    if not self._still_leased_locked(sid, self._generation.get(sid)):
+                        self._free_bookkeeping_locked(sid)
+                return {
+                    "force_freed": 0,
+                    "force_freed_bytes": 0,
+                    "release_pending": 0,
+                }
             # max-hold sweep: force-free abandoned samples (spare still-leased)
             if self.max_hold_age_s is not None:
                 stale = [
@@ -758,6 +810,8 @@ class MooncakeFeatureStore(FeatureStore):
                 "active_leases": len(self._active_leases),
                 "resident_bytes": sum(self._sample_bytes.values()),
                 "max_resident_bytes": self.max_resident_bytes,
+                "retain_on_release": self.retain_on_release,
+                "lifetime_owner": self.lifetime_owner,
                 "auth_required": self.auth.required,
                 "release_pending": len(self._release_pending),
                 "oldest_age_s": max(ages) if ages else 0.0,

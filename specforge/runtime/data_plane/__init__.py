@@ -1,6 +1,11 @@
 # coding=utf-8
 """Data plane: large-tensor storage, transfer, and materialization."""
 
+from specforge.runtime.data_plane.broadcast_ref_distributor import (
+    BroadcastRefDistributor,
+    BroadcastSubscriptionChannel,
+    durable_prefix_cursor,
+)
 from specforge.runtime.data_plane.disaggregated import AuthPolicy, SharedDirFeatureStore
 from specforge.runtime.data_plane.feature_dataloader import FeatureDataLoader
 from specforge.runtime.data_plane.feature_store import (
@@ -25,6 +30,9 @@ __all__ = [
     "SampleRefQueue",
     "dp_partition",
     "RefDistributor",
+    "BroadcastRefDistributor",
+    "BroadcastSubscriptionChannel",
+    "durable_prefix_cursor",
     "FeatureDataLoader",
     "OfflineManifestReader",
     "list_feature_files",

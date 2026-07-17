@@ -17,10 +17,12 @@ is a registry entry, not a new ``build_*`` family.
 from __future__ import annotations
 
 import logging
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from specforge.runtime.contracts import DeploymentMode, SampleRef
 from specforge.runtime.control_plane import (
+    BackpressureConfig,
+    BackpressureController,
     DataFlowController,
     build_control_plane_for_mode,
 )
@@ -33,6 +35,20 @@ from specforge.runtime.data_plane import FeatureStore, LocalFeatureStore
 from specforge.training.strategies.registry import StrategySpec, resolve_strategy
 
 logger = logging.getLogger(__name__)
+
+
+class _DisaggProducerCapacityReporter:
+    """Combine data-plane residency and remote ACK progress for one policy."""
+
+    def __init__(self, feature_store: FeatureStore, channel: Any) -> None:
+        self.feature_store = feature_store
+        self.channel = channel
+
+    def health(self) -> Dict[str, Any]:
+        health = dict(self.feature_store.health())
+        health["remote_in_flight"] = self.channel.in_flight_remote()
+        return health
+
 
 # ---------------------------------------------------------------------------
 # Shared assemblers — strategy- and topology-agnostic.
@@ -618,6 +634,7 @@ def build_disagg_online_producer(
     lease: int = 8,
     in_flight_high_watermark: int = 256,
     backpressure_poll_s: float = 0.2,
+    pause_on_release_pending: bool = False,
     max_worker_failures: int = 3,
     max_prompt_attempts: Optional[int] = 5,
     metadata_store: Optional[MetadataStore] = None,
@@ -669,6 +686,10 @@ def build_disagg_online_producer(
 
     spec = resolve_strategy(strategy)
     sleep = sleep or time.sleep
+    if in_flight_high_watermark < 1:
+        raise ValueError("in_flight_high_watermark must be >= 1")
+    if backpressure_poll_s <= 0:
+        raise ValueError("backpressure_poll_s must be > 0")
     build_start = time.perf_counter()
     prompt_epochs = _normalize_prompt_epochs(prompt_epochs)
     if prompt_epochs > 1:
@@ -682,9 +703,17 @@ def build_disagg_online_producer(
         f"watermark={in_flight_high_watermark}"
     )
     phase = time.perf_counter()
+    backpressure = BackpressureController(
+        BackpressureConfig(
+            max_remote_in_flight=in_flight_high_watermark,
+            pause_on_release_pending=pause_on_release_pending,
+        ),
+        capacity=_DisaggProducerCapacityReporter(feature_store, channel),
+    )
     controller = DataFlowController(
         run_id,
         metadata_store=_resolve_metadata_store(metadata_store, metadata_db_path),
+        backpressure=backpressure,
         max_prompt_attempts=max_prompt_attempts,
     )
     producer_timing(f"DataFlowController created elapsed={elapsed(phase)}")
@@ -768,19 +797,22 @@ def build_disagg_online_producer(
                 if should_stop is not None and should_stop():
                     return
                 _t = time.monotonic()
-                _infl = channel.in_flight_remote()
-                # backpressure: in_flight = published - consumer-acked
-                while _infl >= in_flight_high_watermark:
+                # The controller policy is the single prompt-leasing authority.
+                # In fan-out, remote progress is the minimum consumer ACK cursor.
+                while backpressure.should_pause_prompts():
+                    backpressure.note_rollout_starved()
                     now = time.perf_counter()
                     if (
                         progress_interval > 0
                         and now - last_backpressure_log >= progress_interval
                     ):
                         st = controller.status()
+                        bp = backpressure.snapshot()
                         producer_timing(
                             "backpressure wait "
                             f"worker={w.worker_id} produced={state['produced']} "
-                            f"in_flight={channel.in_flight_remote()} "
+                            f"in_flight={bp['remote_in_flight']} "
+                            f"reasons={bp['pause_reasons']} "
                             f"pending={st['prompts_pending']} "
                             f"leased={st['prompts_leased']} "
                             f"elapsed={elapsed(drive_start)}"
@@ -789,7 +821,7 @@ def build_disagg_online_producer(
                     if should_stop is not None and should_stop():
                         return
                     sleep(backpressure_poll_s)
-                    _infl = channel.in_flight_remote()
+                _infl = channel.in_flight_remote()
                 if _prof:
                     _ps["bp"] += time.monotonic() - _t
                     _ps["infl"] = _infl

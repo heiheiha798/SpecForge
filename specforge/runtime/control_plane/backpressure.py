@@ -19,6 +19,8 @@ Phase-1 policy (this file):
 
 * pause prompt leasing when feature bytes cross a **high watermark**; resume only
   once they fall back below a **low watermark** (hysteresis, so we don't flap);
+* pause at the producer's remote in-flight ref limit or while required shared
+  artifact reclamation is pending;
 * cap in-flight prompt tasks per rollout worker;
 * cap sample refs leased to the trainer per call;
 * count **rollout starvation** (paused, can't produce) and **trainer starvation**
@@ -56,6 +58,8 @@ class BackpressureConfig:
     low_watermark_bytes: Optional[int] = None
     max_inflight_prompts_per_worker: Optional[int] = None
     max_train_lease: Optional[int] = None
+    max_remote_in_flight: Optional[int] = None
+    pause_on_release_pending: bool = False
 
     def __post_init__(self) -> None:
         if self.high_watermark_bytes is not None and self.low_watermark_bytes is None:
@@ -69,6 +73,8 @@ class BackpressureConfig:
                 "low_watermark_bytes must be <= high_watermark_bytes "
                 f"({self.low_watermark_bytes} > {self.high_watermark_bytes})"
             )
+        if self.max_remote_in_flight is not None and self.max_remote_in_flight < 1:
+            raise ValueError("max_remote_in_flight must be >= 1 or None")
 
 
 class BackpressureController:
@@ -87,6 +93,8 @@ class BackpressureController:
         self.config = config or BackpressureConfig()
         self.capacity = capacity
         self._paused = False
+        self._byte_paused = False
+        self._pause_reasons = ()
         self._lock = threading.Lock()
         self._stats = {
             "rollout_starved": 0,  # asked to lease prompts while paused
@@ -102,18 +110,43 @@ class BackpressureController:
         Latches on at the high watermark and off at the low watermark so a store
         hovering near one threshold does not flap pause/resume every call.
         """
+        health = self.capacity.health() if self.capacity is not None else {}
         hi = self.config.high_watermark_bytes
-        if hi is None or self.capacity is None:
-            return False
-        resident = int(self.capacity.health().get("resident_bytes", 0))
+        resident = int(health.get("resident_bytes", 0))
         lo = self.config.low_watermark_bytes
         with self._lock:
-            if not self._paused and resident >= hi:
-                self._paused = True
+            if hi is not None and not self._byte_paused and resident >= hi:
+                self._byte_paused = True
+            elif (
+                hi is not None
+                and lo is not None
+                and self._byte_paused
+                and resident <= lo
+            ):
+                self._byte_paused = False
+
+            reasons = []
+            if self._byte_paused:
+                reasons.append("resident_bytes")
+            remote_limit = self.config.max_remote_in_flight
+            if (
+                remote_limit is not None
+                and int(health.get("remote_in_flight", 0)) >= remote_limit
+            ):
+                reasons.append("remote_in_flight")
+            if self.config.pause_on_release_pending and (
+                int(health.get("release_pending", 0)) > 0
+                or int(health.get("required_reclaims_pending", 0)) > 0
+            ):
+                reasons.append("release_pending")
+
+            paused = bool(reasons)
+            if paused and not self._paused:
                 self._stats["pause_transitions"] += 1
-            elif self._paused and resident <= lo:
-                self._paused = False
+            elif self._paused and not paused:
                 self._stats["resume_transitions"] += 1
+            self._paused = paused
+            self._pause_reasons = tuple(reasons)
             return self._paused
 
     # -- caps ---------------------------------------------------------------
@@ -140,7 +173,11 @@ class BackpressureController:
     # -- observability ------------------------------------------------------
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
-            snap: Dict[str, Any] = {"paused": self._paused, **self._stats}
+            snap: Dict[str, Any] = {
+                "paused": self._paused,
+                "pause_reasons": list(self._pause_reasons),
+                **self._stats,
+            }
         if self.capacity is not None:
             h = self.capacity.health()
             resident = int(h.get("resident_bytes", 0))
@@ -152,6 +189,12 @@ class BackpressureController:
             )
             snap["avg_feature_age_s"] = h.get("avg_age_s")
             snap["oldest_feature_age_s"] = h.get("oldest_age_s")
+            snap["remote_in_flight"] = int(h.get("remote_in_flight", 0))
+            snap["max_remote_in_flight"] = self.config.max_remote_in_flight
+            snap["release_pending"] = int(h.get("release_pending", 0))
+            snap["required_reclaims_pending"] = int(
+                h.get("required_reclaims_pending", 0)
+            )
         return snap
 
 

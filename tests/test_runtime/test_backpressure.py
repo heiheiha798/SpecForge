@@ -19,6 +19,9 @@ class _FakeCapacity:
         self.max_resident_bytes = None
         self.avg_age_s = 0.0
         self.oldest_age_s = 0.0
+        self.remote_in_flight = 0
+        self.release_pending = 0
+        self.required_reclaims_pending = 0
 
     def health(self):
         return {
@@ -26,6 +29,9 @@ class _FakeCapacity:
             "max_resident_bytes": self.max_resident_bytes,
             "avg_age_s": self.avg_age_s,
             "oldest_age_s": self.oldest_age_s,
+            "remote_in_flight": self.remote_in_flight,
+            "release_pending": self.release_pending,
+            "required_reclaims_pending": self.required_reclaims_pending,
         }
 
 
@@ -45,6 +51,8 @@ class TestBackpressurePolicy(unittest.TestCase):
     def test_config_rejects_low_above_high(self):
         with self.assertRaises(ValueError):
             BackpressureConfig(high_watermark_bytes=100, low_watermark_bytes=200)
+        with self.assertRaises(ValueError):
+            BackpressureConfig(max_remote_in_flight=0)
 
     def test_no_config_never_pauses(self):
         bp = BackpressureController()  # empty config, no capacity
@@ -67,6 +75,24 @@ class TestBackpressurePolicy(unittest.TestCase):
         snap = bp.snapshot()
         self.assertEqual(snap["pause_transitions"], 1)
         self.assertEqual(snap["resume_transitions"], 1)
+
+    def test_remote_inflight_and_required_reclaim_are_authoritative(self):
+        cap = _FakeCapacity()
+        bp = BackpressureController(
+            BackpressureConfig(max_remote_in_flight=3, pause_on_release_pending=True),
+            capacity=cap,
+        )
+        cap.remote_in_flight = 3
+        self.assertTrue(bp.should_pause_prompts())
+        self.assertEqual(bp.snapshot()["pause_reasons"], ["remote_in_flight"])
+        cap.remote_in_flight = 2
+        self.assertFalse(bp.should_pause_prompts())
+        cap.required_reclaims_pending = 1
+        self.assertTrue(bp.should_pause_prompts())
+        self.assertEqual(bp.snapshot()["pause_reasons"], ["release_pending"])
+        cap.required_reclaims_pending = 0
+        self.assertFalse(bp.should_pause_prompts())
+        self.assertEqual(bp.snapshot()["resume_transitions"], 2)
 
     def test_cap_prompt_grant(self):
         bp = BackpressureController(

@@ -25,6 +25,7 @@ specforge/runtime/
   data_plane/
     feature_store.py      # FeatureStore ABC + LocalFeatureStore (mem + file + dump)
     sample_ref_queue.py   # SampleRefQueue (lease / ack / fail / depth)
+    broadcast_ref_distributor.py # fixed independent-consumer fan-out + resume
     offline_reader.py     # OfflineManifestReader (.ckpt -> SampleRef)
     feature_dataloader.py # FeatureDataLoader (SampleRef -> TrainBatch)
   inference/
@@ -46,7 +47,9 @@ specforge/runtime/
   Offline EAGLE3 uses `hidden_state` (re-run `TargetHead`) for equivalence;
   `pruned_logits` is the production default (t2d at rollout).
 - **Delivery (ADR-0002):** at-least-once + idempotent effects. `commit_samples`
-  dedupes on `sample_id`; queue `put`/`ack`/`release` are idempotent.
+  dedupes on `sample_id`; queue `put`/`ack`/`release` are idempotent. Independent
+  consumers use stable subscription IDs, and shared capture progress advances at
+  their minimum durable cursor.
 - **Storage (ADR-0003):** `LocalFeatureStore` is in-memory on the hot path with
   an opt-in disk/mmap dump that doubles as the capture/replay tap.
 - **No-tensor invariant:** `SampleRef`/`PromptTask` are frozen dataclasses with no
@@ -73,7 +76,8 @@ work.
 | **M4** | `test_capture.py` + `..._reference.py::test_capture_layer_mismatch_fails` | CPU/CI |
 
 Plus contract/store/loader unit tests (`test_contracts.py`, `test_feature_store.py`,
-`test_feature_dataloader.py`).
+`test_feature_dataloader.py`) and fixed fan-out lifecycle coverage in
+`test_broadcast_ref_distributor.py`.
 
 ## Running the tests
 

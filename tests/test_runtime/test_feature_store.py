@@ -78,6 +78,21 @@ class TestLocalFeatureStore(unittest.TestCase):
         store.release(h2)
         self.assertEqual(store.health()["resident_samples"], 0)  # last lease -> freed
 
+    def test_fanout_retains_until_generation_guarded_reclaim(self):
+        store = LocalFeatureStore("st", retain_on_release=True)
+        stale = store.put({"x": torch.randn(1, 4)}, sample_id="s0", metadata={})
+        _, first = store.get(stale)
+        _, second = store.get(stale)
+        store.release(first)
+        store.release(second)
+        self.assertEqual(store.health()["resident_samples"], 1)
+
+        current = store.put({"x": torch.randn(1, 4)}, sample_id="s0", metadata={})
+        store.reclaim(stale, reason="delayed-global-ack")
+        self.assertEqual(store.health()["resident_samples"], 1)
+        store.reclaim(current, reason="fanout-globally-consumed")
+        self.assertEqual(store.health()["resident_samples"], 0)
+
     def test_online_put_get_release_loop_is_bounded(self):
         # The regression this fix targets: many unique samples, consumed and
         # released, must not accumulate in the store.

@@ -134,6 +134,15 @@ class FeatureStore(abc.ABC):
     @abc.abstractmethod
     def abort(self, sample_id: str, *, reason: str) -> None: ...
 
+    def reclaim(self, sample_ref: SampleRef, *, reason: str = "consumed") -> None:
+        """Reclaim one exact published sample after its last logical consumer.
+
+        Backends with generation-addressed storage override this method so a
+        delayed fan-out ACK cannot delete a newer re-publication. The fallback is
+        suitable only for stores whose sample IDs are never reused.
+        """
+        self.abort(sample_ref.sample_id, reason=reason)
+
     def estimate_bytes(self, specs: Dict[str, FeatureSpec]) -> int:
         total = 0
         for spec in specs.values():
@@ -182,6 +191,7 @@ class LocalFeatureStore(FeatureStore):
         *,
         dump_dir: Optional[str] = None,
         clone_on_get: bool = False,
+        retain_on_release: bool = False,
         max_resident_bytes: Optional[int] = None,
         max_hold_age_s: Optional[float] = None,
         max_release_attempts: int = 3,
@@ -192,6 +202,9 @@ class LocalFeatureStore(FeatureStore):
         # When True the store itself clones on get(); normally the *loader* owns
         # the clone policy (clone-on-fetch default lives there), so this is off.
         self.clone_on_get = clone_on_get
+        # Fan-out consumers release read leases without owning final residency.
+        # The distributor calls reclaim(ref) after every logical consumer ACKs.
+        self.retain_on_release = retain_on_release
         # Optional cap on mem:// residency. None = unbounded. When set, put()
         # raises loudly once exceeded — a defined failure instead of silent OOM.
         self.max_resident_bytes = max_resident_bytes
@@ -424,6 +437,8 @@ class LocalFeatureStore(FeatureStore):
         sid = handle.sample_id
         with self._lock:
             self._active_leases.pop(handle.lease_token, None)
+            if self.retain_on_release:
+                return
             cur = self._generation.get(sid)
             if cur is not None and handle.generation != cur:
                 return  # stale handle (sample was re-put) -> no-op
@@ -452,6 +467,20 @@ class LocalFeatureStore(FeatureStore):
         """Evict a sample immediately (e.g. failed put, terminal sample drop)."""
         with self._lock:
             self._free_sample_locked(sample_id)
+
+    def reclaim(self, sample_ref: SampleRef, *, reason: str = "consumed") -> None:
+        """Free only the generation named by ``sample_ref`` (idempotent)."""
+        expected = _mem_uri_generation(sample_ref.feature_store_uri)
+        with self._lock:
+            current = self._generation.get(sample_ref.sample_id)
+            if current is None or expected is None or current != expected:
+                return
+            if self._still_leased_locked(sample_ref.sample_id, current):
+                raise RuntimeError(
+                    f"cannot reclaim leased sample {sample_ref.sample_id} "
+                    f"generation {current}"
+                )
+            self._free_sample_locked(sample_ref.sample_id)
 
     # -- garbage collection / reclamation ----------------------------------
     def gc(self, *, now: Optional[float] = None) -> Dict[str, int]:
@@ -527,6 +556,7 @@ class LocalFeatureStore(FeatureStore):
                 "active_leases": len(self._active_leases),
                 "resident_bytes": self._resident_bytes_locked(),
                 "max_resident_bytes": self.max_resident_bytes,
+                "retain_on_release": self.retain_on_release,
                 "release_pending": len(self._release_pending),
                 "oldest_age_s": max(ages) if ages else 0.0,
                 "avg_age_s": (sum(ages) / len(ages)) if ages else 0.0,

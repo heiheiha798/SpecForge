@@ -190,6 +190,49 @@ class TestMooncakeFeatureStore(unittest.TestCase):
         out, _ = fs.get(ref)  # still available for the next epoch
         self.assertIn("hidden_state", out)
 
+    def test_fanout_owner_reclaims_after_retained_consumer_leases(self):
+        fs = _store(retain_on_release=True)
+        ref = fs.put(_tensors(), sample_id="s0", metadata=_meta())
+        _, first = fs.get(ref)
+        _, second = fs.get(ref)
+        fs.release(first)
+        fs.release(second)
+        self.assertEqual(fs.health()["resident_samples"], 1)
+
+        fs.reclaim(ref, reason="fanout-globally-consumed")
+        self.assertEqual(fs.health()["resident_samples"], 0)
+        fs.reclaim(ref, reason="duplicate-global-ack")  # idempotent
+
+    def test_stale_fanout_reclaim_cannot_delete_new_generation(self):
+        fs = _store(retain_on_release=True)
+        stale = fs.put(_tensors(), sample_id="s0", metadata=_meta())
+        current = fs.put(_tensors(), sample_id="s0", metadata=_meta())
+
+        fs.reclaim(stale, reason="delayed-consumer-ack")
+        out, handle = fs.get(current)
+        self.assertIn("hidden_state", out)
+        fs.release(handle)
+        fs.reclaim(current, reason="fanout-globally-consumed")
+        self.assertEqual(fs.health()["resident_samples"], 0)
+
+    def test_fanout_consumer_drops_local_state_without_remote_delete(self):
+        fake = _FakeMooncakeStore()
+        owner = MooncakeFeatureStore(store=fake, store_id="run0")
+        consumer = MooncakeFeatureStore(
+            store=fake, store_id="run0", lifetime_owner=False
+        )
+        ref = owner.put(_tensors(), sample_id="s0", metadata=_meta())
+
+        _, handle = consumer.get(ref)
+        consumer.release(handle)
+        self.assertTrue(_phys_resident(fake))
+        self.assertEqual(consumer.health()["resident_samples"], 0)
+        with self.assertRaisesRegex(RuntimeError, "non-owner"):
+            consumer.put(_tensors(), sample_id="s1", metadata=_meta())
+
+        owner.reclaim(ref, reason="fanout-globally-consumed")
+        self.assertFalse(_phys_resident(fake))
+
     def test_consume_once_free_on_last_lease(self):
         fs = _store()
         ref = fs.put(_tensors(), sample_id="s0", metadata=_meta())
