@@ -21,6 +21,15 @@ from specforge.runtime.data_plane.offline_reader import (
 )
 from specforge.runtime.data_plane.ref_distributor import RefDistributor
 from specforge.runtime.data_plane.sample_ref_queue import SampleRefQueue, dp_partition
+from specforge.runtime.data_plane.windowed_capture import (
+    CaptureFailedError,
+    CapturePriority,
+    CaptureReadLease,
+    CaptureRequest,
+    SQLiteWindowedCaptureRegistry,
+    WindowedCaptureQueue,
+    capture_contract_digest,
+)
 
 __all__ = [
     "FeatureStore",
@@ -39,4 +48,11 @@ __all__ = [
     "SharedDirFeatureStore",
     "MooncakeFeatureStore",
     "AuthPolicy",
+    "CaptureFailedError",
+    "CapturePriority",
+    "CaptureReadLease",
+    "CaptureRequest",
+    "SQLiteWindowedCaptureRegistry",
+    "WindowedCaptureQueue",
+    "capture_contract_digest",
 ]
