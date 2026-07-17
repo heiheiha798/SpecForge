@@ -361,6 +361,18 @@ class TestMooncakeFeatureStoreZeroCopy(unittest.TestCase):
         fs = _store()
         self.assertTrue(fs._zero_copy)
 
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for pinning")
+    def test_selected_get_can_fill_pinned_destination_directly(self):
+        fs = _store()
+        src = _tensors()
+        ref = fs.put(src, sample_id="s0", metadata=_meta())
+
+        out, _ = fs.get(ref, names=["hidden_state"], pin_memory=True)
+
+        self.assertEqual(set(out), {"hidden_state"})
+        self.assertTrue(out["hidden_state"].is_pinned())
+        torch.testing.assert_close(out["hidden_state"], src["hidden_state"])
+
     def test_falls_back_to_pickle_without_raw_api(self):
         # a backend that lacks put_from/get_into must transparently use the blob
         # path (and still round-trip).

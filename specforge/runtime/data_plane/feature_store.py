@@ -110,6 +110,11 @@ def _mem_uri_generation(uri: str) -> Optional[int]:
 class FeatureStore(abc.ABC):
     """Stores and serves large feature tensors. Carries no scheduling state."""
 
+    @property
+    def get_returns_fresh_tensors(self) -> bool:
+        """Whether every ``get`` result owns backend-independent storage."""
+        return False
+
     @abc.abstractmethod
     def put(
         self,
@@ -126,6 +131,7 @@ class FeatureStore(abc.ABC):
         *,
         device: "torch.device | str" = "cpu",
         names: Optional[List[str]] = None,
+        pin_memory: bool = False,
     ) -> Tuple[Dict[str, torch.Tensor], FeatureHandle]: ...
 
     @abc.abstractmethod
@@ -344,6 +350,7 @@ class LocalFeatureStore(FeatureStore):
         *,
         device: "torch.device | str" = "cpu",
         names: Optional[List[str]] = None,
+        pin_memory: bool = False,
     ) -> Tuple[Dict[str, torch.Tensor], FeatureHandle]:
         uri = sample_ref.feature_store_uri
         wanted = names or list(sample_ref.feature_keys.keys())
@@ -356,6 +363,13 @@ class LocalFeatureStore(FeatureStore):
         # *after* the lease exists, so on failure we drop the lease before
         # propagating — no leaked borrow.
         try:
+            if pin_memory:
+                if any(tensor.device.type != "cpu" for tensor in tensors.values()):
+                    raise ValueError("pin_memory requires CPU-resident store tensors")
+                tensors = {
+                    name: tensor if tensor.is_pinned() else tensor.pin_memory()
+                    for name, tensor in tensors.items()
+                }
             if str(device) != "cpu":
                 tensors = {k: v.to(device) for k, v in tensors.items()}
             if self.clone_on_get:

@@ -10,15 +10,16 @@
 
 Leases refs (consume-once queue or re-iterable ref list), applies the injected
 per-sample transform and collate, and yields ``TrainBatch``es — no model
-knowledge. clone-on-fetch (default) clones tensors out of the store and releases
-the handle immediately, so prefetch can never race a release.
+knowledge. Clone-on-fetch protects borrowed backend storage; backends that
+guarantee fresh tensors skip that redundant copy. Handles are released before a
+batch is yielded, so prefetch can never race a backend lease.
 """
 
 from __future__ import annotations
 
 import os
 import time
-from typing import Any, Callable, Dict, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
 
 import torch
 
@@ -47,11 +48,14 @@ class FeatureDataLoader:
         collate_fn: Optional[CollateFn] = None,
         per_sample_transform: Optional[PerSampleTransform] = None,
         device: "torch.device | str" = "cpu",
-        clone_on_fetch: bool = True,
+        clone_on_fetch: Optional[bool] = None,
+        feature_names: Optional[Iterable[str]] = None,
         drop_last: bool = True,
         strategy: str = "eagle3",
         ack: bool = True,
         gc_interval_s: Optional[float] = 15.0,
+        prefetch_batches: Optional[int] = None,
+        prefetch_to_device: bool = False,
     ) -> None:
         if (queue is None) == (refs is None):
             raise ValueError(
@@ -64,11 +68,42 @@ class FeatureDataLoader:
         self.collate_fn = collate_fn or _default_collate
         self.per_sample_transform = per_sample_transform
         self.device = device
+        names = None if feature_names is None else tuple(feature_names)
+        if names is not None and (
+            not names
+            or len(names) != len(set(names))
+            or any(not isinstance(name, str) or not name for name in names)
+        ):
+            raise ValueError("feature_names must be non-empty, unique strings")
+        self.feature_names = names
         # CLONE_ON_FETCH=0 skips the defensive clone; safe for the mooncake
         # zero-copy path, whose get() already allocates a fresh tensor.
+        if clone_on_fetch is None:
+            clone_on_fetch = not store.get_returns_fresh_tensors
         if os.environ.get("CLONE_ON_FETCH", "1") == "0":
             clone_on_fetch = False
         self.clone_on_fetch = clone_on_fetch
+        if prefetch_batches is None:
+            prefetch_batches = int(os.environ.get("LOADER_PREFETCH", "0"))
+        if (
+            isinstance(prefetch_batches, bool)
+            or not isinstance(prefetch_batches, int)
+            or prefetch_batches < 0
+        ):
+            raise ValueError("prefetch_batches must be a non-negative integer")
+        if not isinstance(prefetch_to_device, bool):
+            raise TypeError("prefetch_to_device must be a bool")
+        if prefetch_to_device and prefetch_batches == 0:
+            raise ValueError("prefetch_to_device requires prefetch_batches > 0")
+        if prefetch_to_device and queue is None:
+            raise ValueError("prefetch_to_device applies only to a queue stream")
+        if prefetch_to_device and torch.device(device).type != "cuda":
+            raise ValueError("prefetch_to_device requires a CUDA loader device")
+        if prefetch_to_device and not torch.cuda.is_available():
+            raise RuntimeError("prefetch_to_device requires an available CUDA runtime")
+        self.prefetch_batches = prefetch_batches
+        self.prefetch_to_device = prefetch_to_device
+        self._prefetch_stream: Optional[torch.cuda.Stream] = None
         self.drop_last = drop_last
         self.strategy = strategy
         self.ack = ack
@@ -108,17 +143,30 @@ class FeatureDataLoader:
                 f"mixed target_repr values in batch: {sorted(map(repr, target_reprs))}"
             )
 
-        spec_sets = [set(ref.feature_specs) for ref in refs if ref.feature_specs]
+        if self.feature_names is not None:
+            requested = set(self.feature_names)
+            missing = {
+                ref.sample_id: sorted(requested - set(ref.feature_specs))
+                for ref in refs
+                if ref.feature_specs and not requested.issubset(ref.feature_specs)
+            }
+            if missing:
+                raise ValueError(f"requested feature specs are missing: {missing}")
+            spec_sets = [requested for ref in refs if ref.feature_specs]
+        else:
+            spec_sets = [set(ref.feature_specs) for ref in refs if ref.feature_specs]
         if spec_sets and any(spec_set != spec_sets[0] for spec_set in spec_sets[1:]):
             raise ValueError(f"mixed feature spec names in batch: {spec_sets}")
 
         if not spec_sets:
             return
         first_specs = next(ref.feature_specs for ref in refs if ref.feature_specs)
+        names = self.feature_names or tuple(first_specs)
         for ref in refs:
             if not ref.feature_specs:
                 continue
-            for name, spec in ref.feature_specs.items():
+            for name in names:
+                spec = ref.feature_specs[name]
                 expected = first_specs[name]
                 if spec.dtype != expected.dtype or len(spec.shape) != len(
                     expected.shape
@@ -148,34 +196,59 @@ class FeatureDataLoader:
             self._lp_state = s
         return s
 
-    def _materialize(self, ref: SampleRef) -> Dict[str, torch.Tensor]:
+    def _materialize(
+        self,
+        ref: SampleRef,
+        *,
+        device: Optional["torch.device | str"] = None,
+        pin_memory: bool = False,
+    ) -> Dict[str, torch.Tensor]:
         _prof = self._prof_loader
         _t = time.monotonic()
-        tensors, handle = self.store.get(ref, device=self.device)
+        get_kwargs = {
+            "device": self.device if device is None else device,
+            "names": (
+                list(self.feature_names) if self.feature_names is not None else None
+            ),
+        }
+        if pin_memory:
+            get_kwargs["pin_memory"] = True
+        tensors, handle = self.store.get(ref, **get_kwargs)
         if _prof:
             s = self._lp()
             s["get"] += time.monotonic() - _t
             s["bytes"] += sum(t.numel() * t.element_size() for t in tensors.values())
             _t = time.monotonic()
-        if self.clone_on_fetch:
-            tensors = {k: v.clone() for k, v in tensors.items()}
-        if _prof:
-            self._lp()["clone"] += time.monotonic() - _t
-            _t = time.monotonic()
-        self.store.release(handle, reason="loaded")
+        try:
+            if self.clone_on_fetch:
+                tensors = {k: v.clone() for k, v in tensors.items()}
+            if _prof:
+                self._lp()["clone"] += time.monotonic() - _t
+                _t = time.monotonic()
+            if self.per_sample_transform is not None:
+                tensors = self.per_sample_transform(tensors)
+        finally:
+            self.store.release(handle, reason="loaded")
         if _prof:
             self._lp()["rel"] += time.monotonic() - _t
             _t = time.monotonic()
         self._maybe_gc()
         if _prof:
             self._lp()["gc"] += time.monotonic() - _t
-        if self.per_sample_transform is not None:
-            tensors = self.per_sample_transform(tensors)
         return tensors
 
-    def _make_batch(self, refs: List[SampleRef]) -> TrainBatch:
+    def _make_batch(
+        self,
+        refs: List[SampleRef],
+        *,
+        materialize_device: Optional["torch.device | str"] = None,
+        pin_memory: bool = False,
+    ) -> TrainBatch:
         self._validate_refs(refs)
-        per_sample = [self._materialize(r) for r in refs]
+        per_sample = [
+            self._materialize(ref, device=materialize_device, pin_memory=pin_memory)
+            for ref in refs
+        ]
         batch_tensors = self.collate_fn(per_sample)
         non_tensors = [
             name
@@ -193,6 +266,45 @@ class FeatureDataLoader:
                 "ttt_length": refs[0].metadata.get("ttt_length"),
             },
         )
+
+    def _prepare_prefetched_batch(self, refs: List[SampleRef]) -> tuple[
+        TrainBatch,
+        Optional[torch.cuda.Event],
+        Dict[str, torch.Tensor],
+    ]:
+        if not self.prefetch_to_device:
+            return self._make_batch(refs), None, {}
+
+        batch = self._make_batch(refs, materialize_device="cpu", pin_memory=True)
+        if self._prefetch_stream is None:
+            self._prefetch_stream = torch.cuda.Stream(device=self.device)
+        staging: Dict[str, torch.Tensor] = {}
+        moved: Dict[str, torch.Tensor] = {}
+        with torch.cuda.stream(self._prefetch_stream):
+            for name, tensor in batch.tensors.items():
+                source = tensor
+                if tensor.device.type == "cpu" and not tensor.is_pinned():
+                    source = tensor.pin_memory()
+                staging[name] = source
+                moved[name] = source.to(self.device, non_blocking=True)
+            ready = torch.cuda.Event()
+            ready.record(self._prefetch_stream)
+        batch.tensors = moved
+        return batch, ready, staging
+
+    def _wait_prefetched_batch(
+        self,
+        batch: TrainBatch,
+        ready: Optional[torch.cuda.Event],
+        staging: Dict[str, torch.Tensor],
+    ) -> None:
+        if ready is None:
+            return
+        current = torch.cuda.current_stream(device=self.device)
+        current.wait_event(ready)
+        for tensor in batch.tensors.values():
+            tensor.record_stream(current)
+        # ``staging`` keeps pinned sources alive through the event handoff.
 
     def __iter__(self) -> Iterator[TrainBatch]:
         if self._refs is not None:
@@ -237,11 +349,11 @@ class FeatureDataLoader:
         self._seek_batches = skip
 
     def _iter_queue(self) -> Iterator[TrainBatch]:
-        # LOADER_PREFETCH=N (>0) materializes up to N batches ahead on a
+        # Prefetch materializes up to N batches ahead on a
         # background thread so the training step never pays fetch latency
         # inline. Ack still happens on the consuming thread AFTER the trainer
         # has taken the batch (same in-flight semantics as the sync path).
-        depth = int(os.environ.get("LOADER_PREFETCH", "0"))
+        depth = self.prefetch_batches
         if depth > 0:
             yield from self._iter_queue_prefetch(depth)
             return
@@ -304,14 +416,14 @@ class FeatureDataLoader:
                         buf.put(_EOS)
                         return
                     try:
-                        batch = self._make_batch(refs)
+                        batch, ready, staging = self._prepare_prefetched_batch(refs)
                     except Exception as exc:
                         self.queue.fail(
                             refs, reason=f"materialize:{exc}", retryable=False
                         )
                         buf.put(exc)
                         return
-                    buf.put((batch, refs))
+                    buf.put((batch, refs, ready, staging))
             except BaseException as exc:  # loud failure, never a silent hang
                 buf.put(exc)
 
@@ -326,7 +438,9 @@ class FeatureDataLoader:
                 return
             if isinstance(item, BaseException):
                 raise item
-            batch, refs = item
+            batch, refs, ready, staging = item
+            self._wait_prefetched_batch(batch, ready, staging)
+            del ready, staging
             if _prof:
                 s = self._lp()
                 s["b"] += 1

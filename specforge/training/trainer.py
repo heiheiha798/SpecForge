@@ -59,6 +59,9 @@ class Trainer:
         durable_ack: bool = True,
         resume_from: Optional[str] = None,
         max_checkpoints: int = 0,
+        loader_device: str = "cpu",
+        loader_prefetch_batches: int = 0,
+        loader_prefetch_to_device: bool = False,
     ):
         # durable_ack off (local_colocated): no durable ack transaction — the
         # loader releases each feature as it consumes it — so the offline enqueue
@@ -79,8 +82,20 @@ class Trainer:
             batch_size=batch_size,
             collate_fn=collate_fn,
             per_sample_transform=per_sample_transform,
+            device=loader_device,
+            feature_names=(
+                sorted(spec.required_features)
+                if (
+                    "queue" in ref_source
+                    and per_sample_transform is None
+                    and getattr(spec, "required_features", None)
+                )
+                else None
+            ),
             drop_last=True,
             strategy=spec.name,
+            prefetch_batches=loader_prefetch_batches,
+            prefetch_to_device=loader_prefetch_to_device,
         )
 
         dataset_size = len(ref_source["refs"]) if "refs" in ref_source else None

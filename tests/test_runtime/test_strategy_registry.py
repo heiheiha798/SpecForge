@@ -120,6 +120,19 @@ class TestStrategyRegistry(unittest.TestCase):
                 self.assertEqual(batch["input_ids"][0].tolist(), [1, 2, 3, 0, 0])
                 self.assertTrue(torch.all(batch["hidden_states"][0, 3:] == 0))
 
+    def test_dflash_single_sample_collate_preserves_owned_storage(self):
+        sample = {
+            "input_ids": torch.tensor([[1, 2, 3]]),
+            "loss_mask": torch.tensor([[1, 1, 1]]),
+            "hidden_states": torch.ones(1, 3, 4),
+        }
+
+        batch = resolve_strategy("dflash").make_online_collate()([sample])
+
+        self.assertEqual(set(batch), set(sample))
+        for name in sample:
+            self.assertEqual(batch[name].data_ptr(), sample[name].data_ptr())
+
     def test_dspark_online_collate_pads_target_last_hidden(self):
         short = {
             "input_ids": torch.tensor([[1, 2, 3]]),

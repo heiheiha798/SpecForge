@@ -235,6 +235,10 @@ def _dflash_offline_collate():
     """
 
     def collate(feats):
+        if len(feats) == 1:
+            # Online captures already carry a batch dimension. Preserve fresh,
+            # pinned store storage instead of allocating three one-item cats.
+            return dict(feats[0])
         maxlen = max(f["input_ids"].shape[-1] for f in feats)
 
         def pad2d(t):  # [1, n] -> [1, maxlen]

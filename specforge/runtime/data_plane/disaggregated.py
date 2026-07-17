@@ -71,6 +71,10 @@ class AuthPolicy:
 class SharedDirFeatureStore(FeatureStore):
     """A disaggregated ``FeatureStore`` backed by a shared directory."""
 
+    @property
+    def get_returns_fresh_tensors(self) -> bool:
+        return True
+
     def __init__(
         self,
         root: str,
@@ -185,6 +189,7 @@ class SharedDirFeatureStore(FeatureStore):
         *,
         device: "torch.device | str" = "cpu",
         names: Optional[List[str]] = None,
+        pin_memory: bool = False,
     ) -> Tuple[Dict[str, torch.Tensor], FeatureHandle]:
         self.auth.check(self._credential)
         sid = sample_ref.sample_id
@@ -210,6 +215,11 @@ class SharedDirFeatureStore(FeatureStore):
                 raise KeyError(f"{data_path} missing key {raw_key!r} for feature {n!r}")
             # clone-on-fetch (B5): the returned tensor is independent of the store
             out[n] = raw[raw_key].clone()
+        if pin_memory:
+            out = {
+                name: tensor if tensor.is_pinned() else tensor.pin_memory()
+                for name, tensor in out.items()
+            }
         if str(device) != "cpu":
             out = {k: v.to(device) for k, v in out.items()}
         with self._lock:

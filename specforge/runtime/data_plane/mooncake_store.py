@@ -140,12 +140,14 @@ _TORCH_DTYPES = {
 }
 
 
-def _alloc_from_spec(spec) -> torch.Tensor:
+def _alloc_from_spec(spec, *, pin_memory: bool = False) -> torch.Tensor:
     """A fresh contiguous tensor matching a FeatureSpec (the zero-copy dst)."""
     dtype = _TORCH_DTYPES.get(spec.dtype)
     if dtype is None:
         raise KeyError(f"unsupported feature dtype {spec.dtype!r} for zero-copy get")
-    return torch.empty(tuple(int(d) for d in spec.shape), dtype=dtype)
+    return torch.empty(
+        tuple(int(d) for d in spec.shape), dtype=dtype, pin_memory=pin_memory
+    )
 
 
 def _nbytes(t: torch.Tensor) -> int:
@@ -172,6 +174,11 @@ class MooncakeFeatureStore(FeatureStore):
     ``is_exist/remove`` plus either ``put_from``/``get_into`` or ``put``/``get``)
     so the contract is unit-testable without a running master.
     """
+
+    @property
+    def get_returns_fresh_tensors(self) -> bool:
+        # Raw reads allocate from FeatureSpec; pickle reads clone selected tensors.
+        return True
 
     def __init__(
         self,
@@ -523,6 +530,7 @@ class MooncakeFeatureStore(FeatureStore):
         *,
         device: "torch.device | str" = "cpu",
         names: Optional[List[str]] = None,
+        pin_memory: bool = False,
     ) -> Tuple[Dict[str, torch.Tensor], FeatureHandle]:
         self.auth.check(self._credential)
         sid = sample_ref.sample_id
@@ -537,9 +545,14 @@ class MooncakeFeatureStore(FeatureStore):
                 )
         wanted = names or list(sample_ref.feature_keys.keys())
         if self._zero_copy:
-            out, gen = self._get_zero_copy(sample_ref, wanted)
+            out, gen = self._get_zero_copy(sample_ref, wanted, pin_memory=pin_memory)
         else:
             out, gen = self._get_pickle(sample_ref, wanted)
+            if pin_memory:
+                out = {
+                    name: tensor if tensor.is_pinned() else tensor.pin_memory()
+                    for name, tensor in out.items()
+                }
         if str(device) != "cpu":
             out = {k: v.to(device) for k, v in out.items()}
         with self._lock:
@@ -559,7 +572,7 @@ class MooncakeFeatureStore(FeatureStore):
         return out, handle
 
     def _get_zero_copy(
-        self, ref: SampleRef, wanted: List[str]
+        self, ref: SampleRef, wanted: List[str], *, pin_memory: bool = False
     ) -> Tuple[Dict[str, torch.Tensor], int]:
         """Read each feature straight into a spec-allocated tensor (no pickle)."""
         sid = ref.sample_id
@@ -579,7 +592,8 @@ class MooncakeFeatureStore(FeatureStore):
                     f"sample {sid} gen {gen} feature {n!r} not available "
                     f"(freed, stale, or never written)"
                 )
-            out[n] = _alloc_from_spec(spec)  # fresh -> clone-on-fetch for free (B5)
+            # Fresh storage makes the loader's clone-on-fetch redundant (B5).
+            out[n] = _alloc_from_spec(spec, pin_memory=pin_memory)
             self._store_get_tensor(key, out[n])
         return out, gen
 

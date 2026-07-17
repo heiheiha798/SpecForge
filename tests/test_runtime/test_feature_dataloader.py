@@ -48,6 +48,28 @@ class _CountingStore(LocalFeatureStore):
         return super().get(sample_ref, device=device, names=names)
 
 
+class _SelectiveFreshStore(LocalFeatureStore):
+    """Fixture backend that returns owned tensors and records selected names."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.requested = []
+        self.returned_ptrs = {}
+
+    @property
+    def get_returns_fresh_tensors(self):
+        return True
+
+    def get(self, sample_ref, *, device="cpu", names=None):
+        self.requested.append(tuple(names) if names is not None else None)
+        tensors, handle = super().get(sample_ref, device=device, names=names)
+        tensors = {name: tensor.clone() for name, tensor in tensors.items()}
+        self.returned_ptrs = {
+            name: tensor.data_ptr() for name, tensor in tensors.items()
+        }
+        return tensors, handle
+
+
 class TestFeatureDataLoader(unittest.TestCase):
     def _write_offline_files(self, d, n=4, seq=8, h=4, aux=12):
         for i in range(n):
@@ -238,6 +260,89 @@ class TestFeatureDataLoader(unittest.TestCase):
             FeatureDataLoader(store)  # neither queue nor refs
         with self.assertRaises(ValueError):
             FeatureDataLoader(store, SampleRefQueue(), refs=[])  # both
+
+    def test_selective_fresh_get_skips_unused_artifact_and_loader_clone(self):
+        store = _SelectiveFreshStore("fresh")
+        ref = store.put(
+            {
+                "input_ids": torch.arange(8).view(1, 8),
+                "unused_target": torch.randn(1, 8, 64),
+            },
+            sample_id="sample-0",
+            metadata={"run_id": "run", "strategy": "dflash"},
+        )
+        queue = SampleRefQueue()
+        queue.put([ref])
+        loader = FeatureDataLoader(
+            store,
+            queue,
+            batch_size=1,
+            collate_fn=lambda features: features[0],
+            feature_names=("input_ids",),
+            drop_last=False,
+            strategy="dflash",
+            prefetch_batches=0,
+        )
+
+        batch = next(iter(loader))
+
+        self.assertEqual(store.requested, [("input_ids",)])
+        self.assertEqual(set(batch.tensors), {"input_ids"})
+        self.assertFalse(loader.clone_on_fetch)
+        self.assertEqual(
+            batch.tensors["input_ids"].data_ptr(),
+            store.returned_ptrs["input_ids"],
+        )
+
+    def test_prefetch_to_device_requires_enabled_cuda_prefetch(self):
+        with self.assertRaisesRegex(ValueError, "prefetch_batches"):
+            FeatureDataLoader(
+                LocalFeatureStore("invalid-prefetch"),
+                SampleRefQueue(),
+                device="cuda",
+                prefetch_batches=0,
+                prefetch_to_device=True,
+            )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_cuda_prefetch_stream_preserves_values(self):
+        store = LocalFeatureStore("cuda-prefetch")
+        refs = []
+        for index in range(4):
+            refs.append(
+                store.put(
+                    {
+                        "input_ids": torch.arange(16).view(1, 16) + index * 16,
+                        "unused_target": torch.full((1, 16, 32), float(index)),
+                    },
+                    sample_id=f"sample-{index}",
+                    metadata={"run_id": "run", "strategy": "dflash"},
+                )
+            )
+        queue = SampleRefQueue()
+        queue.put(refs)
+        loader = FeatureDataLoader(
+            store,
+            queue,
+            batch_size=2,
+            collate_fn=_simple_collate,
+            device="cuda:0",
+            feature_names=("input_ids",),
+            drop_last=False,
+            strategy="dflash",
+            prefetch_batches=2,
+            prefetch_to_device=True,
+        )
+
+        batches = list(loader)
+        torch.cuda.synchronize()
+
+        self.assertIsNotNone(loader._prefetch_stream)
+        self.assertEqual(len(batches), 2)
+        actual = torch.cat([batch.tensors["input_ids"] for batch in batches])
+        expected = torch.arange(64, device="cuda:0").view(4, 16)
+        torch.testing.assert_close(actual, expected)
+        self.assertTrue(all(set(batch.tensors) == {"input_ids"} for batch in batches))
 
 
 if __name__ == "__main__":
