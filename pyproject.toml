@@ -44,6 +44,7 @@ dev = [
     "unittest"
 ]
 fa = ["flash-attn"]
+liger = ["liger-kernel==0.8.0"]
 
 [tool.setuptools.dynamic]
 version = {file = "version.txt"}
